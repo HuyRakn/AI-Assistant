@@ -1,0 +1,25 @@
+# Aether Core Dependencies
+# Hardware Acceleration
+mlx>=0.21.0
+mlx-data>=0.0.6
+
+# Data Engineering
+pyarrow>=15.0.0
+fastparquet>=2024.2.0
+pandas>=2.2.0
+numpy>=1.26.0
+
+# Text Processing (White-Box)
+unicodedata2>=15.0.0
+regex>=2023.12.25
+sentencepiece>=0.2.0
+
+# Governance
+dvc>=3.48.0
+dvc-s3>=3.1.0  # Optional for cloud storage
+psutil
+
+# Data Mining
+datasets>=2.17.0
+zstandard>=0.22.0
+tqdm>=4.66.0
