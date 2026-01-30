@@ -5,16 +5,18 @@ import mlx.optimizers as optim
 import numpy as np
 from typing import Callable, Iterable
 from .transformer import AetherForCausalLM
+from .manual import ManualCrossEntropy
 from .utils import CheckpointManager
 
 class AetherTrainer:
     """
-    The Crucible: Where the model is forged.
-    Handles the training loop, optimization, and state management.
+    The Crucible: Where the model is forged (White-Box Edition).
+    Handles the training loop using manual math.
     """
-    def __init__(self, model: AetherForCausalLM, optimizer: optim.Optimizer):
+    def __init__(self, model: AetherForCausalLM, optimizer):
         self.model = model
         self.optimizer = optimizer
+        self.loss_fn_metric = ManualCrossEntropy() # White-Box Metric
         self.loss_and_grad_fn = nn.value_and_grad(self.model, self.loss_fn)
         self.checkpoint_manager = CheckpointManager()
 
@@ -24,13 +26,13 @@ class AetherTrainer:
         logits, _ = model(inputs, mask=mask)
         # logits: [B, L, V]
         
-        # Cross Entropy
         # Reshape for computation
         logits = logits.reshape(-1, logits.shape[-1])
         targets = targets.reshape(-1)
         
-        loss = nn.losses.cross_entropy(logits, targets)
-        return mx.mean(loss)
+        # White-Box Manual Cross Entropy
+        loss = self.loss_fn_metric(logits, targets)
+        return loss
 
     def train_step(self, start_tokens: mx.array, target_tokens: mx.array):
         loss, grads = self.loss_and_grad_fn(self.model, start_tokens, target_tokens)

@@ -17,6 +17,7 @@ class AetherConfig:
     norm_eps: float = 1e-5          # Epsilon for RMSNorm
     rope_theta: float = 10000.0     # Base period for RoPE
     rope_traditional: bool = False  # False = Standard Llama RoPE
+    dropout: float = 0.1            # Dropout probability (White-Box Requirement)
     
     def __post_init__(self):
         if self.n_kv_heads is None:

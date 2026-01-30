@@ -35,9 +35,20 @@ class RoPE(nn.Module):
         # Precompute frequency cis (cos + i*sin) is done dynamically usually or cached.
         
     def __call__(self, x, offset: int = 0):
-        # Delegate to MLX optimized kernel for Titan performance
-        # x: [Batch, SeqLen, HeadDim] or [Batch, SeqLen, Heads, HeadDim]
-        return mx.fast.rope(x, self.dims, traditional=False, base=self.base, scale=1.0, offset=offset)
+        # Manual White-Box RoPE (Sovereign Math)
+        # 1. Generate frequencies
+        B, L, H, D = x.shape
+        cos, sin = precompute_freqs_cis(D, L + offset, self.base)
+        
+        # Select the slice corresponding to current window
+        cos = cos[offset : offset + L]
+        sin = sin[offset : offset + L]
+        
+        # Reshape for broadcast: [L, D/2] -> [1, L, 1, D/2]
+        cos = cos.reshape(1, L, 1, -1)
+        sin = sin.reshape(1, L, 1, -1)
+        
+        return apply_rope(x, cos, sin)
         
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (mx.arange(0, dim, 2)[: (dim // 2)].astype(mx.float32) / dim))
@@ -47,15 +58,28 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     return mx.cos(freqs), mx.sin(freqs)
 
 def apply_rope(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
-    # x: [Batch, Len, Heads, HeadDim]
-    # Simple complex rotation logic:
-    # (a + ib) * (c + id) = (ac - bd) + i(ad + bc)
-    # Here inputs are real. x -> [x1, x2] pairs.
-    # Actually MLX has optimized `mx.fast.rope`. We should use it for "Production/Titan" speed.
-    # If the user wants "White Box", they probably mean "Don't use HuggingFace Transformers".
-    # Using MLX primitives is allowed.
-    return mx.fast.rope(x, scaled=False, traditional=False, base=10000.0, offset=0) 
-    # Wait, need to pass offset dynamically.
+    # x: [B, H, L, D]
+    # Split into real and imaginary parts (or pairs)
+    # x = [x0, x1, x2, x3, ...]
+    
+    # Reshape to separate pairs: [B, H, L, D/2, 2]
+    # Note: Optimization for [B, H, L, D] layout
+    B, H, L, D = x.shape
+    x_reshaped = x.reshape(B, H, L, -1, 2)
+    
+    x1 = x_reshaped[..., 0] # Real part
+    x2 = x_reshaped[..., 1] # Imaginary part
+    
+    # Rotate:
+    # x1' = x1 * cos - x2 * sin
+    # x2' = x1 * sin + x2 * cos
+    
+    out_x1 = x1 * cos - x2 * sin
+    out_x2 = x1 * sin + x2 * cos
+    
+    # Stack back and flatten
+    out = mx.stack([out_x1, out_x2], axis=-1)
+    return out.reshape(B, H, L, D)
 
 class SwiGLU(nn.Module):
     """
@@ -67,6 +91,7 @@ class SwiGLU(nn.Module):
         self.gate_proj = nn.Linear(config.dim, config.hidden_dim, bias=False)
         self.up_proj = nn.Linear(config.dim, config.hidden_dim, bias=False)
         self.down_proj = nn.Linear(config.hidden_dim, config.dim, bias=False)
+        self.dropout = nn.Dropout(config.dropout)
 
     def __call__(self, x):
         # Gate path (Cognition Gate)
@@ -75,8 +100,9 @@ class SwiGLU(nn.Module):
         value = self.up_proj(x)
         # Element-wise mult
         h = gate * value
-        # Down project
-        return self.down_proj(h)
+        # Down project with Dropout
+        output = self.down_proj(h)
+        return self.dropout(output)
 
 class AetherAttention(nn.Module):
     """
@@ -94,7 +120,12 @@ class AetherAttention(nn.Module):
         self.v_proj = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, config.dim, bias=False)
         
-        self.rope = nn.RoPE(self.head_dim, base=config.rope_theta)
+        # USE MANUAL WHITE-BOX ROPE
+        self.rope = RoPE(self.head_dim, base=config.rope_theta)
+        
+        # Manual Dropout Components
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
 
     def __call__(self, x: mx.array, mask: Optional[mx.array] = None, cache=None):
         B, L, D = x.shape
@@ -105,34 +136,75 @@ class AetherAttention(nn.Module):
         values = self.v_proj(x)
         
         # Reshape for heads: [B, L, H, D_h] -> Transpose to [B, H, L, D_h]
+        # This layout is optimal for Attention (H is batch-like)
         queries = queries.reshape(B, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         
         # Apply RoPE (Titan Positioning)
+        # Optimization: Apply directly on [B, H, L, D] without Transpose
         # Now input is [B, H, L, D], RoPE will treat axis 2 (L) as sequence correctly
+        
         if cache is not None:
              # If using KV cache (during generation), apply RoPE with offset
-             offset = cache[0].shape[2] # cache shape is [B, H, L, D]
+             # cache shape is [B, H, L, D] usually.
+             offset = cache.offset if hasattr(cache, 'offset') else 0
+             # Note: simple RoPE call handles offset logic
              queries = self.rope(queries, offset=offset)
              keys = self.rope(keys, offset=offset)
         else:
              queries = self.rope(queries)
              keys = self.rope(keys)
              
-        # KV Cache management would happen here for generation
+        # KV Cache management (Static Cache Optimization)
         if cache is not None:
-            key_cache, value_cache = cache
-            keys = mx.concatenate([key_cache, keys], axis=2)
-            values = mx.concatenate([value_cache, values], axis=2)
+            # cache is now expected to be an instance of StaticKVCache
+            # But the recursive logic in model passes it down.
+            # Wait, `cache` in call arg is usually the state.
             
-        # Scaled Dot Product Attention
-        # MLX optimized primitive expects [B, H, L, D]
-        output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
-        )
+            # If cache is tuple (keys, values) -> Old way (Dynamic) - Fallback for backward compat if needed?
+            # Or assume we fully switched. User wants FULL remediation.
+            # We assume `cache` passed here IS the `StaticKVCache` object layer-specific.
+            
+            # Wait, `cache` is passed as list to `model` and then `layer_cache` to layer.
+            # So `cache` here is the `StaticKVCache` instance for this layer.
+            
+            if hasattr(cache, 'update_and_fetch'):
+                 keys, values = cache.update_and_fetch(keys, values)
+            else:
+                 # Fallback to old concatenation if cache is just a tuple (not recommended by audit)
+                 key_cache, value_cache = cache
+                 keys = mx.concatenate([key_cache, keys], axis=2)
+                 values = mx.concatenate([value_cache, values], axis=2)
+            
+        # --- WHITE-BOX ATTENTION IMPLEMENTATION (NO FUSED KERNELS) ---
+        # 1. Compute Scores: Q * K^T / sqrt(d)
+        # queries: [B, H, L, D]
+        # keys:    [B, H, L_kv, D] -> Transpose to [B, H, D, L_kv]
+        # Result:  [B, H, L, L_kv]
         
-        # Output is [B, H, L, D] -> Transpose back to [B, L, H, D]
+        # Explicit Matrix Multiplication
+        scores = (queries @ keys.transpose(0, 1, 3, 2)) * self.scale
+        
+        # 2. Apply Causal Mask (Manual)
+        if mask is not None:
+            # mask should be additive (0 for keep, -inf for discard)
+            scores = scores + mask
+            
+        # 3. Softmax (Probabilities) - The heart of attention
+        probs = mx.softmax(scores, axis=-1)
+        
+        # 4. Dropout (Anti-Overfitting/Regularization)
+        # Randomly zero out attention weights
+        probs = self.attn_dropout(probs)
+        
+        # 5. Weighted Sum: Probs * Values
+        output = probs @ values
+        # output: [B, H, L, D]
+        # -------------------------------------------------------------
+        
+        # Transpose back to [B, L, H, D] then reshape to [B, L, H*D]
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         
-        return self.o_proj(output), (keys, values)
+        # Final Output Projection with Dropout
+        return self.resid_dropout(self.o_proj(output)), (keys, values)

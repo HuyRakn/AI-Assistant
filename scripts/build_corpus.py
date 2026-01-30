@@ -8,16 +8,15 @@ sys.path.append(os.path.abspath("src"))
 
 from aether.data.ingestion import create_pipeline, stream_parquet_dataset
 from aether.data.normalization import UnicodeFirewall, ViToneNormalizer
+from aether.preprocessing.english import EnglishNormalizer
 
 def build_corpus():
-    print("🏭 Aether Data Factory: Starting Processing Line...")
+    print("🏭 Aether Data Factory: Starting Processing Line (Enterprise Sharding)...")
     
     # Paths
     input_file = "data/raw/wikipedia/wiki_vi.parquet"
-    output_txt = "data/processed/clean_corpus_vi.txt"
-    output_parquet = "data/processed/clean_corpus_vi.parquet"
-    
-    os.makedirs("data/processed", exist_ok=True)
+    output_dir = "data/processed/shards"
+    os.makedirs(output_dir, exist_ok=True)
     
     if not os.path.exists(input_file):
         print(f"❌ Input file not found: {input_file}")
@@ -26,57 +25,60 @@ def build_corpus():
     # Initialize Normalizers
     firewall = UnicodeFirewall()
     tone_norm = ViToneNormalizer()
+    eng_norm = EnglishNormalizer()
     
     def process_text(text):
-        # 1. Unicode Normalization (NFC)
         text = firewall.enforce_nfc(text)
-        # 2. Tone Normalization (New Style)
         text = tone_norm.normalize(text)
-        # 3. Basic Cleaning (replace newlines for TXT format if needed, but SP handles it)
-        # Let's keep newlines but maybe collapse multiple spaces
+        # Apply English Normalization (Stemming for mixed content)
+        # Note: This will stem english words embedded in VN text.
+        text = eng_norm.normalize(text)
         return " ".join(text.split())
 
     print(f"   Input: {input_file}")
-    print("   Applying: Unicode Firewall + ViToneNormalizer")
-    
-    # We use our own generator loop instead of create_pipeline because we want to Write to disk,
-    # not just stream to GPU. mlx.data is great for training loop, but for ETL to disk, 
-    # a simple efficient loop using our normalization logic is sufficient and easier to control output format.
     
     start = time.time()
-    count = 0
+    total_docs = 0
+    shard_size = 100000 # Docs per shard
+    current_shard_idx = 0
+    current_shard_docs = 0
     
-    with open(output_txt, 'w', encoding='utf-8') as f_txt:
-        # Stream from Parquet using our helper
-        stream = stream_parquet_dataset([input_file])
-        
+    # Open first shard
+    f_out = open(f"{output_dir}/corpus_vi_part_{current_shard_idx:03d}.txt", 'w', encoding='utf-8')
+    
+    # Stream from Parquet
+    stream = stream_parquet_dataset([input_file])
+    
+    try:
         for record in stream:
-             # decode bytes from ingestion stream
              raw_text = record['text'].decode('utf-8')
              
-             if len(raw_text) < 100: # Filter short articles
-                 continue
+             if len(raw_text) < 100: continue
                  
              clean_text = process_text(raw_text)
              
-             # Write to text file (one doc per line or just concat? SP assumes one sentence per line preferably)
-             # But for wiki articles, preserving structure is good. 
-             # Let's write raw text with newlines escaped or just as stream?
-             # SentencePiece trains on raw sentences.
-             # Let's replace actual newlines with space to make "one doc per line" or "one paragraph per line"
+             f_out.write(clean_text + "\n")
+             total_docs += 1
+             current_shard_docs += 1
              
-             f_txt.write(clean_text + "\n")
-             count += 1
+             # Rotate Shard
+             if current_shard_docs >= shard_size:
+                 f_out.close()
+                 print(f"   Shard {current_shard_idx:03d} filled ({current_shard_docs} docs).")
+                 current_shard_idx += 1
+                 current_shard_docs = 0
+                 f_out = open(f"{output_dir}/corpus_vi_part_{current_shard_idx:03d}.txt", 'w', encoding='utf-8')
              
-             if count % 10000 == 0:
-                 print(f"   Processed {count} docs...", end='\r')
+             if total_docs % 10000 == 0:
+                 print(f"   Processed {total_docs} docs...", end='\r')
                  
+    finally:
+        f_out.close()
+        
     print(f"\n✅ Processing Complete.")
-    print(f"   Docs: {count}")
+    print(f"   Total Docs: {total_docs}")
+    print(f"   Shards Created: {current_shard_idx + (1 if current_shard_docs > 0 else 0)}")
     print(f"   Time: {time.time() - start:.2f}s")
-    print(f"   Output (TXT): {output_txt}")
-    
-    # We could also save Parquet here if we wanted 'id' tracking, but for now TXT is priority for Tokenizer.
 
 if __name__ == "__main__":
     build_corpus()
