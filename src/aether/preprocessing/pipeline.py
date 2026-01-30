@@ -23,9 +23,9 @@ class AetherDataFactory:
         self.segmenter = VietnameseSegmenter()
         self.eng_norm = EnglishNormalizer() # Disconnected Treasury Fixed
         
-        # Load Tokenizer using Sovereign AetherBPE
-        from ..tokenization.bpe import AetherBPE
-        self.tokenizer = AetherBPE()
+        # Load Tokenizer using Sovereign Tokenizer (Linked List BPE)
+        from ..tokenization.core_bpe import SovereignTokenizer
+        self.tokenizer = SovereignTokenizer()
         
         if tokenizer_model_path:
              self.tokenizer.load(tokenizer_model_path)
@@ -38,8 +38,7 @@ class AetherDataFactory:
     def stream_deduplication(self, text_iterator: Iterator[str], batch_size: int = 10000) -> Iterator[str]:
         """
         Streaming Deduplication (Generator).
-        Prevents RAM explosion by processing in batches while maintaining 
-        a global LSH index in memory.
+        Uses Redis-backed MinHashLSH to enforce Global Uniqueness across all batches.
         
         Args:
             text_iterator: Generator or Iterator yielding strings.
@@ -49,35 +48,8 @@ class AetherDataFactory:
             Unique documents.
         """
         batch = []
-        # We need a way to track duplicates globally. 
-        # MinHashLSH in this repo currently recalculates bands per call?
-        # To support streaming, we need persistent buckets in dedup_engine.
-        # Assuming dedup_engine (MinHashLSH) is persistent and we can just check against it?
-        # The current MinHashLSH.lsh_banding takes a list of signatures.
-        # We should probably adapt it or just keep "seen signatures" here if cheap.
-        # But MinHash signatures are arrays.
-        
-        # Let's use a simplified approach for this Phase:
-        # 1. Accumulate batch.
-        # 2. Check collisions within batch.
-        # 3. Check collisions against history (requires storage).
-        
-        # PRO IMPLEMENTATION: 
-        # We will add signatures to the engine incrementally.
-        # But `dedup_engine` might not have `add` method.
-        # Let's implement a batch-process that maintains a lightweight history of "Band Hashes".
-        
-        # For this refactor, we focus on the Memory Safety first:
-        # We assume the user accepts that we deduplicate *within* specific windows 
-        # OR we maintain a set of seen checksums (Exact Dedup) + MinHash (Fuzzy)?
-        
-        # Let's Implement: Batch-Processing with Global Signature Tracking.
-        # We will store `seen_band_hashes` in the factory or engine.
-        
-        # Note: Ideally this logic belongs in `MinHashLSH`, but we are patching Pipeline.
-        # We will simply process batches and prevent the list explosion.
-        
         print(f"Starting Streaming Deduplication (Batch Size: {batch_size})...")
+        print("   - Backend: Redis (Global Persistent Index)")
         
         for text in text_iterator:
             batch.append(text)
@@ -95,9 +67,8 @@ class AetherDataFactory:
                 yield doc
 
     def _deduplicate_batch(self, batch: List[str]) -> List[str]:
-        """Internal batch processor (Stateful)."""
+        """Internal batch processor. Checks against Global Redis Index."""
         # 1. Compute Signatures
-        # We process sequentially or parallel?
         # Parallel compute signatures first (MLX efficiency)
         signatures = [self.dedup_engine.compute_signature(t) for t in batch]
         
@@ -107,7 +78,7 @@ class AetherDataFactory:
         import hashlib
         
         for i, sig in enumerate(signatures):
-            # Check if exists in history
+            # Check if exists in history (Redis)
             is_dupe = self.dedup_engine.query(sig)
             
             if not is_dupe:
@@ -121,8 +92,6 @@ class AetherDataFactory:
                 self.dedup_engine.insert(sig, doc_id)
             else:
                 # Duplicate: Drop it
-                # (Optional: We could verify Jaccard here if we stored signatures, 
-                # but for memory efficiency we trust LSH bands)
                 pass
                 
         return unique_batch_docs
@@ -137,11 +106,24 @@ class AetherDataFactory:
         # 2. Normalize (Tonality & Unicode)
         text = self.normalizer.normalize(text)
         
-        # 3. English Normalization
+        # 3. English Normalization (Always run, safe for VN too as it targets english chars)
         text = self.eng_norm.normalize(text)
 
-        # 4. Word Segmentation (Compound Identification)
-        text = self.segmenter.segment(text)
+        # 4. Language Routing (White-Box Heuristic)
+        # Check for Vietnamese-specific tone marks or 'đ'.
+        # If detected, apply Word Segmentation.
+        # If not, assume English/Code and skip segmentation to preserve structure.
+        VN_SPECIFIC_CHARS = set("àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ")
+        
+        # Fast check: set intersection generally fast enough for streaming
+        # Optimization: Check a sample or use regex? Set intersection on string is O(N).
+        # Given pipeline is CPU bound, this is acceptable for correctness.
+        
+        is_vietnamese = any(c in VN_SPECIFIC_CHARS for c in text.lower())
+        
+        if is_vietnamese:
+             # Word Segmentation (Compound Identification)
+             text = self.segmenter.segment(text)
         
         return text
 

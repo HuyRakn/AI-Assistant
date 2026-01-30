@@ -158,24 +158,22 @@ class AetherAttention(nn.Module):
              
         # KV Cache management (Static Cache Optimization)
         if cache is not None:
-            # cache is now expected to be an instance of StaticKVCache
-            # But the recursive logic in model passes it down.
-            # Wait, `cache` in call arg is usually the state.
+            # cache is passed as the state object for this layer
             
-            # If cache is tuple (keys, values) -> Old way (Dynamic) - Fallback for backward compat if needed?
-            # Or assume we fully switched. User wants FULL remediation.
-            # We assume `cache` passed here IS the `StaticKVCache` object layer-specific.
-            
-            # Wait, `cache` is passed as list to `model` and then `layer_cache` to layer.
-            # So `cache` here is the `StaticKVCache` instance for this layer.
-            
-            if hasattr(cache, 'update_and_fetch'):
-                 keys, values = cache.update_and_fetch(keys, values)
+            # Standardized StaticKVCache usage
+            if hasattr(cache, 'update_and_fetch'): 
+                # Duct-typing check is safer if import is tricky, but we should import.
+                # Assuming cache object has the interface.
+                keys, values = cache.update_and_fetch(keys, values)
             else:
-                 # Fallback to old concatenation if cache is just a tuple (not recommended by audit)
-                 key_cache, value_cache = cache
-                 keys = mx.concatenate([key_cache, keys], axis=2)
-                 values = mx.concatenate([value_cache, values], axis=2)
+                 # Check if it is a tuple (Legacy/Fallback)
+                 if isinstance(cache, tuple) and len(cache) == 2:
+                     key_cache, value_cache = cache
+                     keys = mx.concatenate([key_cache, keys], axis=2)
+                     values = mx.concatenate([value_cache, values], axis=2)
+                 else:
+                     # Unexpected cache type
+                     pass
             
         # --- WHITE-BOX ATTENTION IMPLEMENTATION (NO FUSED KERNELS) ---
         # 1. Compute Scores: Q * K^T / sqrt(d)

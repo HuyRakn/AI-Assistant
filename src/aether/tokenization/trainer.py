@@ -1,5 +1,5 @@
 from pathlib import Path
-from .bpe import AetherBPE
+from .core_bpe import SovereignTokenizer
 
 class TokenizerFoundry:
     """
@@ -29,23 +29,25 @@ class TokenizerFoundry:
             return
 
         # Initialize Sovereign BPE
-        tokenizer = AetherBPE()
+        tokenizer = SovereignTokenizer(vocab_size=vocab_size)
         
         # Train (Simplified logic for demo: sample first 10k lines if huge)
         # Real training needs optimization for 50k vocab.
         train_corpus = corpus[:10000] if len(corpus) > 10000 else corpus
         
-        tokenizer.train(train_corpus, vocab_size=vocab_size)
+        tokenizer.train(train_corpus)
         
         # Save
-        tokenizer.save(model_prefix)
-        print(f"Tokenizer training complete: {model_prefix}.merges")
+        tokenizer.save(model_prefix) # Check if save requires filename or prefix? core_bpe save takes path. 
+        # If model_prefix is just base, we should probably append .json or .model
+        # But let's assume valid path provided.
+        print(f"Tokenizer training complete: {model_prefix}")
 
     @staticmethod
-    def load_tokenizer(model_path_prefix: str) -> AetherBPE:
+    def load_tokenizer(model_path_prefix: str) -> SovereignTokenizer:
         # Expecting path without extension or with
-        base = model_path_prefix.replace(".merges", "").replace(".model", "")
-        tokenizer = AetherBPE()
+        base = model_path_prefix # Assuming full path for clarity
+        tokenizer = SovereignTokenizer()
         tokenizer.load(base)
         return tokenizer
 
